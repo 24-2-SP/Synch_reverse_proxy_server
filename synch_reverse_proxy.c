@@ -5,16 +5,14 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
-#include <sys/epoll.h>
 #include "cache.h"
 #include "load_balancer.h"
 
 #define MAX_BUFFER_SIZE 1024
-#define MAX_EVENTS 10
 
 // 요청을 처리하는 함수 프로토타입
 void handle_request(int client_sock);
-void send_response(int client_sock, const char *response, int is_head, int response_size);
+void send_response(int client_sock, const char *response, int is_head, int response_size, const char *content_type); // 선언 수정
 httpserver select_server_based_on_mode();
 
 // 전역 변수로 설정 값 선언
@@ -24,6 +22,7 @@ char TARGET_SERVER2[256];
 int TARGET_PORT;
 int CACHE_ENABLED;
 int LOAD_BALANCER_MODE;
+
 // 설정 파일에서 값을 읽어오는 함수
 void load_config(const char *config_file) {
     FILE *file = fopen(config_file, "r");
@@ -57,10 +56,9 @@ void load_config(const char *config_file) {
 }
 
 int main() {
-    int server_sock, client_sock, epoll_fd;
-    struct sockaddr_in server_addr;
-    struct epoll_event ev, events[MAX_EVENTS];
-    socklen_t client_len;
+    int server_sock, client_sock;
+    struct sockaddr_in server_addr, client_addr;
+    socklen_t client_len = sizeof(client_addr);
 
     // 설정 파일 읽기
     load_config("reverse_proxy.conf");
@@ -113,52 +111,22 @@ int main() {
 
     printf("Server listening on port %d...\n", PROXY_PORT);
 
-    // epoll 생성
-    epoll_fd = epoll_create1(0);
-    if (epoll_fd == -1) {
-        perror("epoll_create1 failed");
-        close(server_sock);
-        exit(EXIT_FAILURE);
-    }
-
-    // 서버 소켓을 epoll에 등록
-    ev.events = EPOLLIN;
-    ev.data.fd = server_sock;
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_sock, &ev) == -1) {
-        perror("epoll_ctl failed");
-        close(server_sock);
-        close(epoll_fd);
-        exit(EXIT_FAILURE);
-    }
-
     while (1) {
-        // 이벤트 대기
-        int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
-        if (nfds == -1) {
-            perror("epoll_wait failed");
-            break;
+        // 새로운 클라이언트 연결 수락
+        client_sock = accept(server_sock, (struct sockaddr *)&client_addr, &client_len);
+        if (client_sock == -1) {
+            perror("Accept failed");
+            continue;
         }
 
-        for (int i = 0; i < nfds; i++) {
-            if (events[i].data.fd == server_sock) {
-                // 새로운 클라이언트 연결 수락
-                client_sock = accept(server_sock, NULL, NULL);
-                if (client_sock == -1) {
-                    perror("Accept failed");
-                    continue;
-                }
-
-                // 동기 방식으로 요청 처리
-                handle_request(client_sock);
-            }
-        }
+        // 동기 방식으로 요청 처리
+        handle_request(client_sock);
+        close(client_sock); // 요청 처리 후 클라이언트 소켓 종료
     }
 
     close(server_sock);
-    close(epoll_fd);
     return 0;
 }
-
 
 void handle_request(int client_sock) {
     int server_sock;
@@ -175,9 +143,6 @@ void handle_request(int client_sock) {
         return;
     }
 
-    // 디버깅: 수신된 요청 출력
-    printf("Request content:\n%.*s\n", (int)bytes_read, buffer);
-
     // GET, HEAD 메서드 및 URL, 프로토콜 추출
     if (sscanf(buffer, "%s %s %s", method, url, protocol) != 3) {
         fprintf(stderr, "Failed to parse the request line properly\n");
@@ -185,82 +150,66 @@ void handle_request(int client_sock) {
         return;
     }
 
-    httpserver server = select_server_based_on_mode(); //로드 밸런서 호출
-    printf("Selected server: %s:%d\n", server.ip, server.port);
+    httpserver server = select_server_based_on_mode(); // 로드 밸런서 호출
 
-    // 디버깅: 파싱된 결과 출력
-    printf("Parsed method: %s, URL: %s, Protocol: %s\n", method, url, protocol);
-
-    // URL 유효성 검사
-    if ((strcmp(method, "GET") != 0) && (strcmp(method, "HEAD") != 0)) {
-        fprintf(stderr, "Invalid request method: %s\n", method);
+    // 백엔드 서버와 연결
+    server_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_sock < 0) {
+        perror("Socket creation failed");
         close(client_sock);
         return;
     }
 
-    char cached_data[MAX_BUFFER_SIZE] = {0};
-    if (CACHE_ENABLED && cache_lookup(url, cached_data)) {
-        // 캐시 히트 메시지 출력
-        printf("Cache hit for URL: %s\n\n\n", url);
-        send_response(client_sock, cached_data, strcmp(method, "HEAD") == 0, strlen(cached_data));  // HEAD일 경우 본문 제외
-    } else {
-        // 캐시 미스 처리
-        printf("Cache miss for URL: %s\n\n\n", url);
+    memset(&target_addr, 0, sizeof(target_addr));
+    target_addr.sin_family = AF_INET;
+    target_addr.sin_port = htons(server.port);
+    inet_pton(AF_INET, server.ip, &target_addr.sin_addr);
 
-        server_sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (server_sock < 0) {
-            perror("Socket creation failed");
-            close(client_sock);
-            return;
-        }
-
-        memset(&target_addr, 0, sizeof(target_addr));
-        target_addr.sin_family = AF_INET;
-        target_addr.sin_port = htons(server.port);
-        inet_pton(AF_INET, server.ip, &target_addr.sin_addr);
-
-        if (connect(server_sock, (struct sockaddr *)&target_addr, sizeof(target_addr)) < 0) {
-            perror("Connection failed");
-            close(client_sock);
-            close(server_sock);
-            return;
-        }
-
-        // 요청 전달
-        if (write(server_sock, buffer, bytes_read) < 0) {
-            perror("Failed to forward request");
-            close(client_sock);
-            close(server_sock);
-            return;
-        }
-
-        // 응답 수신 및 스트리밍 방식으로 클라이언트로 전달
-        ssize_t bytes_received;
-        char response_buffer[MAX_BUFFER_SIZE] = {0};
-        int response_size = 0;
-        while ((bytes_received = read(server_sock, response_buffer + response_size, sizeof(response_buffer) - response_size)) > 0) {
-            response_size += bytes_received;
-        }
-
-        if (bytes_received < 0) {
-            perror("Failed to receive response from backend server");
-        } else {
-            // 캐시에 응답 저장 (응답 크기 검사)
-            if (CACHE_ENABLED) {
-                printf("Store response for URL: %s into cache\n\n\n", url);
-                cache_store(url, response_buffer);
-            }
-
-            // 클라이언트로 응답 전송
-            send_response(client_sock, response_buffer, strcmp(method, "HEAD") == 0, response_size);
-        }
-
+    if (connect(server_sock, (struct sockaddr *)&target_addr, sizeof(target_addr)) < 0) {
+        perror("Connection failed");
+        close(client_sock);
         close(server_sock);
+        return;
     }
 
-    close(client_sock);
-}
+    // 요청 전달
+    if (write(server_sock, buffer, bytes_read) < 0) {
+        perror("Failed to forward request");
+        close(client_sock);
+        close(server_sock);
+        return;
+    }
 
+    // 응답 수신 및 스트리밍 방식으로 클라이언트로 전달
+    ssize_t bytes_received;
+    char response_buffer[MAX_BUFFER_SIZE] = {0};
+    int response_size = 0;
+    char content_type[256] = {0};  // Content-Type을 저장할 변수
+
+    // 응답 헤더를 먼저 읽어서 Content-Type 추출
+    while ((bytes_received = read(server_sock, response_buffer + response_size, sizeof(response_buffer) - response_size)) > 0) {
+        response_size += bytes_received;
+
+        // Content-Type 헤더 파싱
+        if (response_size > 0) {
+            char *content_type_header = strstr(response_buffer, "Content-Type: ");
+            if (content_type_header) {
+                // Content-Type 헤더를 찾은 후 그 값을 추출
+                sscanf(content_type_header, "Content-Type: %255[^\r\n]", content_type);
+                break;
+            }
+        }
+    }
+
+    if (bytes_received < 0) {
+        perror("Failed to receive response from backend server");
+    } else {
+        // 클라이언트로 응답 전송
+        send_response(client_sock, response_buffer, strcmp(method, "HEAD") == 0, response_size, content_type);
+    }
+
+    close(server_sock);
+}
 
 httpserver select_server_based_on_mode() {
     httpserver server;
@@ -283,20 +232,18 @@ httpserver select_server_based_on_mode() {
     return server;
 }
 
-
-
 // HTTP 응답을 클라이언트로 전송하는 함수
-void send_response(int client_sock, const char *response, int is_head, int response_size) {
-    // HTTP/1.1 응답 헤더 작성 (Content-Type은 텍스트로 설정)
+void send_response(int client_sock, const char *response, int is_head, int response_size, const char *content_type) {
+    // HTTP/1.1 응답 헤더 작성
     const char *header_format = "HTTP/1.1 200 OK\r\n"
-                                "Content-Type: text/plain\r\n"  // 응답의 타입 설정
-                                "Connection: close\r\n"         // 연결 종료 헤더
-                                "Content-Length: %d\r\n"        // 본문 길이
-                                "\r\n";  // 헤더와 본문 구분
+                                "Content-Type: %s\r\n"   // 백엔드 서버에서 받은 Content-Type 사용
+                                "Connection: close\r\n"   // 연결 종료 헤더
+                                "Content-Length: %d\r\n"  // 본문 길이
+                                "\r\n";                  // 헤더와 본문 구분
 
     // 응답 헤더의 크기를 계산하여 Content-Length에 설정
     char header[512];
-    snprintf(header, sizeof(header), header_format, response_size);
+    snprintf(header, sizeof(header), header_format, content_type, response_size);
 
     // 헤더 전송
     if (write(client_sock, header, strlen(header)) < 0) {
