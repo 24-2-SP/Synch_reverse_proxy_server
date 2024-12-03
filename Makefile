@@ -12,7 +12,7 @@ LOAD_BALANCER_DIR = $(SRC_DIR)/load_balancer
 SOURCES = $(CACHE_DIR)/cache.c \
           $(HEALTH_CHECK_DIR)/health_check.c \
           $(LOAD_BALANCER_DIR)/load_balancer.c \
-          $(SRC_DIR)/asynch_reverse_proxy.c
+          $(SRC_DIR)/synch_reverse_proxy.c
 
 # Header files
 HEADERS = $(CACHE_DIR)/cache.h \
