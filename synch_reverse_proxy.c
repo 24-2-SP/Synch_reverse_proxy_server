@@ -8,12 +8,20 @@
 #include "cache.h"
 #include "load_balancer.h"
 
-#define MAX_BUFFER_SIZE 1024
+#define MAX_BUFFER_SIZE 655036
+#define MAX_EVENTS 1000
+#define HEALTH_CHECK_INTERVAL 5
 
 // 요청을 처리하는 함수 프로토타입
 void handle_request(int client_sock);
-void send_response(int client_sock, const char *response, int is_head, int response_size, const char *content_type); // 선언 수정
-httpserver select_server_based_on_mode();
+void send_response(int client_sock, const char *response_header, const char *response_body, int is_head, int response_size);
+
+httpserver servers[] = {
+    {"10.198.138.212", 12345, 3, 1},
+    {"10.198.138.213", 12345, 10, 1}
+};
+
+int server_count = 2;
 
 // 전역 변수로 설정 값 선언
 int PROXY_PORT;
@@ -22,6 +30,67 @@ char TARGET_SERVER2[256];
 int TARGET_PORT;
 int CACHE_ENABLED;
 int LOAD_BALANCER_MODE;
+
+void *health_check(void *arg) {
+    while (1) {
+        for (int i = 0; i < server_count; i++) {
+            int sock = socket(AF_INET, SOCK_STREAM, 0);
+            if (sock < 0) {
+                perror("Socket creation failed for health check");
+                continue;
+            }
+
+            struct sockaddr_in addr;
+            memset(&addr, 0, sizeof(addr));
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(servers[i].port);
+            inet_pton(AF_INET, servers[i].ip, &addr.sin_addr);
+
+            // 서버 연결 확인
+            if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+                servers[i].is_healthy = 1;
+                printf("Server %s:%d is healthy\n", servers[i].ip, servers[i].port);
+            } else {
+                servers[i].is_healthy = 0;
+                printf("Server %s:%d is unhealthy\n", servers[i].ip, servers[i].port);
+            }
+
+            close(sock);
+        }
+
+        // HEALTH_CHECK_INTERVAL 초 동안 대기
+        sleep(HEALTH_CHECK_INTERVAL);
+    }
+
+    return NULL;
+}
+
+// 로드 밸런서 수정: Health Check 기반 선택
+httpserver weighted_round_robin() {
+    int total_weight = 0;
+    httpserver *selected_server = NULL;
+
+    for (int i = 0; i < server_count; i++) {
+        if (servers[i].is_healthy) {
+            total_weight += servers[i].weight;
+            servers[i].current_weight += servers[i].weight;
+
+            if (selected_server == NULL || servers[i].current_weight > selected_server->current_weight) {
+                selected_server = &servers[i];
+            }
+        }
+    }
+
+    if (selected_server == NULL) {
+        fprintf(stderr, "No healthy servers available\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // 선택된 서버의 가중치를 감소
+    selected_server->current_weight -= total_weight;
+
+    return *selected_server;
+}
 
 // 설정 파일에서 값을 읽어오는 함수
 void load_config(const char *config_file) {
@@ -63,12 +132,15 @@ int main() {
     // 설정 파일 읽기
     load_config("reverse_proxy.conf");
 
-    httpserver servers[] = {
-        {"10.198.138.212", 12345, 3},
-        {"10.198.138.213", 12345, 10}
-    };
     init_http_servers(servers, 2);
     printf("Selected ip and port : %s, %d\n", servers[0].ip, servers[0].port);
+
+    pthread_t health_thread;
+    if (pthread_create(&health_thread, NULL, health_check, NULL) != 0) {
+        perror("Failed to create health check thread");
+        exit(EXIT_FAILURE);
+    }
+    pthread_detach(health_thread);
 
     // 캐시 초기화
     if (CACHE_ENABLED) {
@@ -150,100 +222,167 @@ void handle_request(int client_sock) {
         return;
     }
 
-    httpserver server = select_server_based_on_mode(); // 로드 밸런서 호출
+    httpserver server = weighted_round_robin(); // 로드 밸런서 호출
+    printf("Forwarding to server: %s:%d\n", server.ip, server.port);
 
-    // 백엔드 서버와 연결
-    server_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_sock < 0) {
-        perror("Socket creation failed");
-        close(client_sock);
-        return;
-    }
+    char cached_data[MAX_BUFFER_SIZE] = {0};
+    int header_size = 0;
+    char header_buffer[MAX_BUFFER_SIZE] = {0};
+    int newline_count = 0;
+    int max_newline = 4;
 
-    memset(&target_addr, 0, sizeof(target_addr));
-    target_addr.sin_family = AF_INET;
-    target_addr.sin_port = htons(server.port);
-    inet_pton(AF_INET, server.ip, &target_addr.sin_addr);
+    if (CACHE_ENABLED && cache_lookup(url, cached_data)) {
+        // 캐시 히트 메시지 출력
+        printf("Cache hit for URL: %s\n\n\n", url);
 
-    if (connect(server_sock, (struct sockaddr *)&target_addr, sizeof(target_addr)) < 0) {
-        perror("Connection failed");
-        close(client_sock);
-        close(server_sock);
-        return;
-    }
+        if (strstr(cached_data, "Transfer-Encoding: chunked") != NULL) {
+            max_newline = 5; // chunked가 있으면 \n 5개까지 찾기
+            printf("this is chuncked\n");
+        }
 
-    // 요청 전달
-    if (write(server_sock, buffer, bytes_read) < 0) {
-        perror("Failed to forward request");
-        close(client_sock);
-        close(server_sock);
-        return;
-    }
-
-    // 응답 수신 및 스트리밍 방식으로 클라이언트로 전달
-    ssize_t bytes_received;
-    char response_buffer[MAX_BUFFER_SIZE] = {0};
-    int response_size = 0;
-    char content_type[256] = {0};  // Content-Type을 저장할 변수
-
-    // 응답 헤더를 먼저 읽어서 Content-Type 추출
-    while ((bytes_received = read(server_sock, response_buffer + response_size, sizeof(response_buffer) - response_size)) > 0) {
-        response_size += bytes_received;
-
-        // Content-Type 헤더 파싱
-        if (response_size > 0) {
-            char *content_type_header = strstr(response_buffer, "Content-Type: ");
-            if (content_type_header) {
-                // Content-Type 헤더를 찾은 후 그 값을 추출
-                sscanf(content_type_header, "Content-Type: %255[^\r\n]", content_type);
-                break;
+        for (int i = 0; i < sizeof(cached_data); i++) {
+            header_size++;
+            if (cached_data[i] == '\n') {
+                newline_count++;
+                if (newline_count == max_newline) {
+                    break;
+                }
             }
         }
-    }
+        // 헤더와 본문을 분리
+        memcpy(header_buffer, cached_data, header_size);
 
-    if (bytes_received < 0) {
-        perror("Failed to receive response from backend server");
+        send_response(client_sock, header_buffer, cached_data, strcmp(method, "HEAD") == 0, strlen(cached_data));
     } else {
-        // 클라이언트로 응답 전송
-        send_response(client_sock, response_buffer, strcmp(method, "HEAD") == 0, response_size, content_type);
-    }
+        // 캐시 미스 처리
+        printf("Cache miss for URL: %s\n\n\n", url);
 
-    close(server_sock);
+        // 백엔드 서버와 연결
+        server_sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (server_sock < 0) {
+            perror("Socket creation failed");
+            close(client_sock);
+            return;
+        }
+
+        memset(&target_addr, 0, sizeof(target_addr));
+        target_addr.sin_family = AF_INET;
+        target_addr.sin_port = htons(server.port);
+        inet_pton(AF_INET, server.ip, &target_addr.sin_addr);
+
+        if (connect(server_sock, (struct sockaddr *)&target_addr, sizeof(target_addr)) < 0) {
+            perror("Connection failed");
+            close(client_sock);
+            close(server_sock);
+            return;
+        }
+        // 요청 전달
+        if (write(server_sock, buffer, bytes_read) < 0) {
+            perror("Failed to forward request");
+            close(client_sock);
+            close(server_sock);
+            return;
+        }
+        // 응답 수신 및 스트리밍 방식으로 클라이언트로 전달
+        ssize_t bytes_received;
+        char response_buffer[MAX_BUFFER_SIZE] = {0};
+        int response_size = 0;
+        if(strstr(url, "/jpg") != NULL) {
+            size_t chunk_size;
+            while (1) {
+                // 청크 헤더 읽기 (청크 크기)
+                bytes_received = read(server_sock, buffer, MAX_BUFFER_SIZE);
+                if (bytes_received <= 0) {
+                    if (bytes_received == 0) {
+                            printf("Connection closed by server.\n");
+                    } else {
+                            perror("Read failed");
+                    }
+                    break;
+                }
+                buffer[bytes_received] = '\0';
+
+                // 청크 크기 파싱
+                sscanf(buffer, "%zx", &chunk_size);
+                if (chunk_size == 0) {
+                    printf("End of chunked transfer.\n");
+                    break;
+                }
+
+                // 청크 데이터 읽기
+                char *data_start = strstr(buffer, "\r\n") + 2; // 청크 헤더 이후 데이터 시작
+                fwrite(data_start, 1, chunk_size, stdout);
+
+                // 다음 청크로 이동
+           }
+        } else {
+            while ((bytes_received = read(server_sock, response_buffer + response_size, sizeof(response_buffer) - response_size)) > 0) {
+                response_size += bytes_received;
+            }
+
+            if (strstr(response_buffer, "Transfer-Encoding: chunked") != NULL) {
+                max_newline = 5; // chunked가 있으면 \n 5개까지 찾기
+                printf("this is chuncked\n");
+            }
+
+             for (int i = 0; i < sizeof(response_buffer); i++) {
+                header_size++;
+                if (response_buffer[i] == '\n') {
+                    newline_count++;
+                    if (newline_count == max_newline) {
+                        break;
+                    }
+                }
+             }
+
+            // 헤더와 본문을 분리
+            memcpy(header_buffer, response_buffer, header_size);
+
+            if (bytes_received < 0) {
+                perror("Failed to receive response from backend server");
+            } else {
+                // 캐시에 응답 저장 (응답 크기 검사)
+                if (CACHE_ENABLED) {
+                    printf("Store response for URL: %s into cache\n\n\n", url);
+                    cache_store(url, response_buffer);
+                }
+                // 클라이언트로 응답 전송
+               send_response(client_sock, header_buffer, response_buffer + header_size, strcmp(method, "HEAD") == 0, response_size - header_size);
+            }
+        }
+        close(server_sock);
+    }
+    close(client_sock);
+    return NULL;
 }
 
-httpserver select_server_based_on_mode() {
-    httpserver server;
-    if (LOAD_BALANCER_MODE == 0) {
-        server = round_robin();
-        printf("Load Balancer Mode: Round Robin\n");
-    } else if (LOAD_BALANCER_MODE == 1) {
-        server = weighted_round_robin();
-        printf("Load Balancer Mode: Weighted Round Robin\n");
-    } else if (LOAD_BALANCER_MODE == 2) {
-        server = least_connection();
-        printf("Load Balancer Mode: Least Connection\n");
-    } else {
-        // 로드 밸런서를 사용하지 않는 경우 첫 번째 서버로 고정
-        strcpy(server.ip, "10.198.138.212");
-        server.port = 12345;
-        printf("Load Balancer Mode: None (Fixed server selected)\n");
-    }
 
-    return server;
-}
+//httpserver select_server_based_on_mode() {
+//    httpserver server;
+//    if (LOAD_BALANCER_MODE == 0) {
+//        server = round_robin();
+//        printf("Load Balancer Mode: Round Robin\n");
+//    } else if (LOAD_BALANCER_MODE == 1) {
+//        server = weighted_round_robin();
+//        printf("Load Balancer Mode: Weighted Round Robin\n");
+//    } else if (LOAD_BALANCER_MODE == 2) {
+//        server = least_connection();
+//        printf("Load Balancer Mode: Least Connection\n");
+//    } else {
+//        // 로드 밸런서를 사용하지 않는 경우 첫 번째 서버로 고정
+//        strcpy(server.ip, "10.198.138.212");
+//        server.port = 12345;
+//        printf("Load Balancer Mode: None (Fixed server selected)\n");
+//    }
+//
+//    return server;
+//}
 
 // HTTP 응답을 클라이언트로 전송하는 함수
-void send_response(int client_sock, const char *response, int is_head, int response_size, const char *content_type) {
-    // HTTP/1.1 응답 헤더 작성
-    const char *header_format = "HTTP/1.1 200 OK\r\n"
-                                "Content-Type: %s\r\n"   // 백엔드 서버에서 받은 Content-Type 사용
-                                "Connection: close\r\n"   // 연결 종료 헤더
-                                "Content-Length: %d\r\n"  // 본문 길이
-                                "\r\n";                  // 헤더와 본문 구분
-
-    // 응답 헤더의 크기를 계산하여 Content-Length에 설정
+void send_response(int client_sock, const char *response_header, const char *response_body, int is_head, int response_size) {
+        // 응답 헤더의 크기를 계산하여 Content-Length에 설정
     char header[512];
-    snprintf(header, sizeof(header), header_format, content_type, response_size);
+    snprintf(header, sizeof(header), response_header, response_size);
 
     // 헤더 전송
     if (write(client_sock, header, strlen(header)) < 0) {
@@ -253,9 +392,8 @@ void send_response(int client_sock, const char *response, int is_head, int respo
 
     // 본문이 있으면 본문 전송
     if (!is_head) {
-        if (write(client_sock, response, response_size) < 0) {
+        if (write(client_sock, response_body, response_size) < 0) {
             perror("Failed to send response body");
         }
     }
 }
-
